@@ -2,8 +2,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,6 +14,7 @@ use std::sync::RwLock;
 use async_stream::stream;
 use axum::body::Body;
 use axum::body::Bytes;
+use axum::extract::ConnectInfo;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -29,6 +32,8 @@ use if_addrs::IfAddr;
 use serde_json::json;
 use serde_json::Map;
 use serde_json::Value;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -61,7 +66,14 @@ const DEFAULT_PROXY_REQUEST_BODY_LIMIT_MIB: usize = 512;
 const DEFAULT_PROXY_REQUEST_BODY_LIMIT_BYTES: usize =
     DEFAULT_PROXY_REQUEST_BODY_LIMIT_MIB * 1024 * 1024;
 const DEFAULT_PROXY_UPSTREAM_TIMEOUT_SECS: u64 = 1_800;
+const DEFAULT_PROXY_MODEL: &str = "gpt-5.4";
+const DEFAULT_PROXY_EFFORT: &str = "high";
 const PROXY_REQUEST_BODY_LIMIT_MIB_ENV_VAR: &str = "CODEX_TOOLS_PROXY_MAX_BODY_MIB";
+const PROXY_SETTINGS_FILE_NAME: &str = "proxy-settings.json";
+const PROXY_LOGS_DIR_NAME: &str = "logs";
+const PROXY_ACCESS_LOG_FILE_NAME: &str = "access.jsonl";
+const PROXY_ERROR_LOG_FILE_NAME: &str = "error.jsonl";
+const PROXY_DEBUG_LOG_FILE_NAME: &str = "debug.jsonl";
 const CODEX_CLIENT_VERSION: &str = "0.101.0";
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
 const SSE_DONE: &str = "data: [DONE]\n\n";
@@ -83,11 +95,74 @@ const CLIENT_MODEL_REJECTIONS: &[(&str, &str)] = &[("gpt5.4", "gpt-5-4"), ("gpt-
 const RESPONSE_MODEL_NORMALIZATIONS: &[(&str, &str)] =
     &[("gpt5.4", "gpt-5.4"), ("gpt-5-4", "gpt-5.4")];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ProxyAuditLogLevel {
+    Off,
+    #[serde(alias = "info")]
+    Basic,
+    Debug,
+}
+
+impl Default for ProxyAuditLogLevel {
+    fn default() -> Self {
+        Self::Basic
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ProxySettings {
+    default_model: String,
+    default_effort: String,
+    audit_log_level: ProxyAuditLogLevel,
+}
+
+impl Default for ProxySettings {
+    fn default() -> Self {
+        Self {
+            default_model: DEFAULT_PROXY_MODEL.to_string(),
+            default_effort: DEFAULT_PROXY_EFFORT.to_string(),
+            audit_log_level: ProxyAuditLogLevel::Basic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProxyAuditAccessEntry {
+    timestamp: String,
+    method: String,
+    path: String,
+    client_ip: Option<String>,
+    status_code: u16,
+    duration_ms: u128,
+    model: Option<String>,
+    stream: Option<bool>,
+    upstream_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProxyAuditErrorEntry {
+    timestamp: String,
+    path: String,
+    status_code: u16,
+    message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProxyAuditDebugEntry {
+    timestamp: String,
+    path: String,
+    request_summary: Value,
+    response_summary: Value,
+}
+
 #[derive(Clone)]
 pub(crate) struct ProxyStorageContext {
     pub(crate) data_dir: PathBuf,
     pub(crate) store_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) auth_refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) audit_log_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) sync_active_auth_on_refresh: bool,
 }
 
@@ -175,12 +250,14 @@ pub(crate) fn new_proxy_storage_context(
     data_dir: PathBuf,
     store_lock: Arc<tokio::sync::Mutex<()>>,
     auth_refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    audit_log_lock: Arc<tokio::sync::Mutex<()>>,
     sync_active_auth_on_refresh: bool,
 ) -> ProxyStorageContext {
     ProxyStorageContext {
         data_dir,
         store_lock,
         auth_refresh_lock,
+        audit_log_lock,
         sync_active_auth_on_refresh,
     }
 }
@@ -194,6 +271,7 @@ fn app_proxy_storage_context(
         app_data_dir(app)?,
         state.store_lock.clone(),
         state.auth_refresh_lock.clone(),
+        state.audit_log_lock.clone(),
         true,
     ))
 }
@@ -309,9 +387,11 @@ pub(crate) async fn start_api_proxy_with_runtime(
         .with_state(context.clone());
 
     let task = tokio::spawn(async move {
-        let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-        });
+        let server =
+            axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                });
 
         if let Err(error) = server.await {
             let mut snapshot = context.shared.lock().await;
@@ -404,19 +484,365 @@ pub(crate) async fn refresh_api_proxy_key_with_runtime(
     }
 }
 
+fn proxy_settings_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(PROXY_SETTINGS_FILE_NAME)
+}
+
+fn proxy_logs_dir_from_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(PROXY_LOGS_DIR_NAME)
+}
+
+fn proxy_access_log_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    proxy_logs_dir_from_data_dir(data_dir).join(PROXY_ACCESS_LOG_FILE_NAME)
+}
+
+fn proxy_error_log_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    proxy_logs_dir_from_data_dir(data_dir).join(PROXY_ERROR_LOG_FILE_NAME)
+}
+
+fn proxy_debug_log_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    proxy_logs_dir_from_data_dir(data_dir).join(PROXY_DEBUG_LOG_FILE_NAME)
+}
+
+fn load_proxy_settings_from_data_dir(data_dir: &Path) -> Result<ProxySettings, String> {
+    let path = proxy_settings_path_from_data_dir(data_dir);
+    if !path.exists() {
+        return Ok(ProxySettings::default());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("读取代理配置失败 {}: {error}", path.display()))?;
+
+    match serde_json::from_str::<ProxySettings>(&raw) {
+        Ok(mut settings) => {
+            normalize_proxy_settings(&mut settings);
+            Ok(settings)
+        }
+        Err(error) => {
+            log::warn!(
+                "代理配置文件格式无效，已回退到默认设置 {}: {}",
+                path.display(),
+                error
+            );
+            Ok(ProxySettings::default())
+        }
+    }
+}
+
+fn normalize_proxy_settings(settings: &mut ProxySettings) {
+    settings.default_model = normalize_configured_default_model(&settings.default_model);
+    settings.default_effort = normalize_configured_default_effort(&settings.default_effort);
+}
+
+fn normalize_configured_default_model(model: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_PROXY_MODEL.to_string();
+    }
+
+    if let Some((_, mapped)) = REQUEST_MODEL_MAPPINGS
+        .iter()
+        .find(|(request_name, _)| trimmed.eq_ignore_ascii_case(request_name))
+    {
+        return (*mapped).to_string();
+    }
+
+    if let Some((_, normalized)) = RESPONSE_MODEL_NORMALIZATIONS
+        .iter()
+        .find(|(legacy_name, _)| trimmed.eq_ignore_ascii_case(legacy_name))
+    {
+        return (*normalized).to_string();
+    }
+
+    trimmed.to_string()
+}
+
+fn normalize_configured_default_effort(effort: &str) -> String {
+    let trimmed = effort.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_PROXY_EFFORT.to_string();
+    }
+
+    match trimmed.to_ascii_lowercase().as_str() {
+        "minimal" | "low" | "medium" | "high" => trimmed.to_ascii_lowercase(),
+        _ => DEFAULT_PROXY_EFFORT.to_string(),
+    }
+}
+
+fn append_jsonl_entry(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("无法解析日志目录 {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("创建日志目录失败 {}: {error}", parent.display()))?;
+
+    let serialized =
+        serde_json::to_string(value).map_err(|error| format!("序列化日志条目失败: {error}"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("打开日志文件失败 {}: {error}", path.display()))?;
+    writeln!(file, "{serialized}")
+        .map_err(|error| format!("写入日志文件失败 {}: {error}", path.display()))?;
+    set_private_permissions(path);
+    Ok(())
+}
+
+fn append_proxy_audit_logs(
+    data_dir: &Path,
+    settings: &ProxySettings,
+    access: &ProxyAuditAccessEntry,
+    error: Option<&ProxyAuditErrorEntry>,
+    debug: Option<&ProxyAuditDebugEntry>,
+) -> Result<(), String> {
+    if settings.audit_log_level == ProxyAuditLogLevel::Off {
+        return Ok(());
+    }
+
+    append_jsonl_entry(&proxy_access_log_path_from_data_dir(data_dir), access)?;
+
+    if let Some(entry) = error {
+        append_jsonl_entry(&proxy_error_log_path_from_data_dir(data_dir), entry)?;
+    }
+
+    if settings.audit_log_level == ProxyAuditLogLevel::Debug {
+        if let Some(entry) = debug {
+            append_jsonl_entry(&proxy_debug_log_path_from_data_dir(data_dir), entry)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn current_timestamp_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| now_unix_seconds().to_string())
+}
+
+fn client_ip_from_connect_info(connect_info: Option<&ConnectInfo<SocketAddr>>) -> Option<String> {
+    connect_info.map(|value| value.0.ip().to_string())
+}
+
+fn summarize_chat_request_for_debug(
+    request: &Value,
+    resolved_model: &str,
+    downstream_stream: bool,
+) -> Value {
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let last_user_message = messages
+        .iter()
+        .rev()
+        .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|item| item.get("content"))
+        .map(extract_debug_preview);
+
+    json!({
+        "model": normalize_model_for_client(resolved_model),
+        "stream": downstream_stream,
+        "messageCount": messages.len(),
+        "lastUserMessagePreview": last_user_message,
+    })
+}
+
+fn summarize_responses_request_for_debug(
+    request: &Value,
+    resolved_model: &str,
+    downstream_stream: bool,
+) -> Value {
+    let input = request.get("input").cloned().unwrap_or(Value::Null);
+    let input_count = match &input {
+        Value::Array(items) => items.len(),
+        Value::Null => 0,
+        _ => 1,
+    };
+
+    json!({
+        "model": normalize_model_for_client(resolved_model),
+        "stream": downstream_stream,
+        "inputCount": input_count,
+        "inputPreview": extract_debug_preview(&input),
+    })
+}
+
+fn summarize_models_response_for_debug() -> Value {
+    json!({
+        "modelCount": MODELS.len(),
+    })
+}
+
+fn summarize_chat_response_for_debug(completed: &Value) -> Value {
+    json!({
+        "id": completed.get("id").and_then(Value::as_str),
+        "model": completed
+            .get("model")
+            .and_then(Value::as_str)
+            .map(normalize_model_for_client),
+        "status": completed.get("status").and_then(Value::as_str),
+        "outputTextPreview": extract_response_output_preview(completed),
+        "usage": completed.get("usage").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn summarize_responses_response_for_debug(completed: &Value) -> Value {
+    json!({
+        "id": completed.get("id").and_then(Value::as_str),
+        "model": completed
+            .get("model")
+            .and_then(Value::as_str)
+            .map(normalize_model_for_client),
+        "status": completed.get("status").and_then(Value::as_str),
+        "outputTextPreview": extract_response_output_preview(completed),
+        "usage": completed.get("usage").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn extract_response_output_preview(completed: &Value) -> Option<String> {
+    completed
+        .get("output")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .and_then(|contents| {
+                        contents.iter().find_map(|content| {
+                            content
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(|text| truncate_for_error(text, 200))
+                        })
+                    })
+            })
+        })
+}
+
+fn extract_debug_preview(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(truncate_for_error(text, 200)),
+        Value::Array(items) => items.iter().find_map(extract_debug_preview),
+        Value::Object(object) => {
+            if let Some(text) = object.get("text").and_then(Value::as_str) {
+                return Some(truncate_for_error(text, 200));
+            }
+            if let Some(content) = object.get("content") {
+                return extract_debug_preview(content);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+async fn record_proxy_audit(
+    context: &ProxyContext,
+    access: ProxyAuditAccessEntry,
+    error: Option<ProxyAuditErrorEntry>,
+    debug: Option<ProxyAuditDebugEntry>,
+) {
+    let settings = match load_proxy_settings_from_data_dir(&context.storage.data_dir) {
+        Ok(settings) => settings,
+        Err(load_error) => {
+            log::warn!("{load_error}");
+            ProxySettings::default()
+        }
+    };
+
+    let _guard = context.storage.audit_log_lock.lock().await;
+    if let Err(error_text) = append_proxy_audit_logs(
+        &context.storage.data_dir,
+        &settings,
+        &access,
+        error.as_ref(),
+        debug.as_ref(),
+    ) {
+        log::warn!("{error_text}");
+    }
+}
+
+fn build_access_entry(
+    method: &str,
+    path: &str,
+    client_ip: Option<String>,
+    status_code: StatusCode,
+    started_at: std::time::Instant,
+    model: Option<&str>,
+    stream: Option<bool>,
+    upstream_request_id: Option<String>,
+) -> ProxyAuditAccessEntry {
+    ProxyAuditAccessEntry {
+        timestamp: current_timestamp_rfc3339(),
+        method: method.to_string(),
+        path: path.to_string(),
+        client_ip,
+        status_code: status_code.as_u16(),
+        duration_ms: started_at.elapsed().as_millis(),
+        model: model.map(normalize_model_for_client),
+        stream,
+        upstream_request_id,
+    }
+}
+
+fn build_error_entry(path: &str, status_code: StatusCode, message: String) -> ProxyAuditErrorEntry {
+    ProxyAuditErrorEntry {
+        timestamp: current_timestamp_rfc3339(),
+        path: path.to_string(),
+        status_code: status_code.as_u16(),
+        message,
+    }
+}
+
+async fn snapshot_last_proxy_error(context: &ProxyContext) -> Option<String> {
+    context.shared.lock().await.last_error.clone()
+}
+
+fn extract_upstream_request_id(headers: &HeaderMap) -> Option<String> {
+    for name in ["openai-request-id", "x-request-id", "request-id"] {
+        if let Some(value) = headers.get(name).and_then(|header| header.to_str().ok()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 async fn health_handler() -> impl IntoResponse {
     Json(json!({ "ok": true }))
 }
 
 async fn models_handler(
     State(context): State<Arc<ProxyContext>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response<Body> {
+    let started_at = std::time::Instant::now();
+    let path = "/v1/models";
+    let client_ip = client_ip_from_connect_info(connect_info.as_ref());
+
     if let Some(response) = ensure_authorized(&headers, &context.api_key) {
+        let status = response.status();
+        record_proxy_audit(
+            &context,
+            build_access_entry("GET", path, client_ip, status, started_at, None, None, None),
+            Some(build_error_entry(
+                path,
+                status,
+                "Invalid proxy api key.".to_string(),
+            )),
+            None,
+        )
+        .await;
         return response;
     }
 
-    Json(json!({
+    let response = Json(json!({
         "object": "list",
         "data": MODELS
             .iter()
@@ -430,40 +856,167 @@ async fn models_handler(
             })
             .collect::<Vec<_>>(),
     }))
-    .into_response()
+    .into_response();
+
+    record_proxy_audit(
+        &context,
+        build_access_entry(
+            "GET",
+            path,
+            client_ip,
+            response.status(),
+            started_at,
+            None,
+            None,
+            None,
+        ),
+        None,
+        Some(ProxyAuditDebugEntry {
+            timestamp: current_timestamp_rfc3339(),
+            path: path.to_string(),
+            request_summary: json!({}),
+            response_summary: summarize_models_response_for_debug(),
+        }),
+    )
+    .await;
+
+    response
 }
 
 async fn chat_completions_handler(
     State(context): State<Arc<ProxyContext>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
+    let started_at = std::time::Instant::now();
+    let path = "/v1/chat/completions";
+    let client_ip = client_ip_from_connect_info(connect_info.as_ref());
+
     if let Some(response) = ensure_authorized(&headers, &context.api_key) {
+        let status = response.status();
+        record_proxy_audit(
+            &context,
+            build_access_entry("POST", path, client_ip, status, started_at, None, None, None),
+            Some(build_error_entry(
+                path,
+                status,
+                "Invalid proxy api key.".to_string(),
+            )),
+            None,
+        )
+        .await;
         return response;
     }
 
-    let request_json = match parse_json_request(&body) {
+    let request_json = match parse_json_request_message(&body) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(message) => {
+            let response = invalid_request_response(&message);
+            let status = response.status();
+            record_proxy_audit(
+                &context,
+                build_access_entry("POST", path, client_ip, status, started_at, None, None, None),
+                Some(build_error_entry(path, status, message)),
+                None,
+            )
+            .await;
+            return response;
+        }
     };
 
+    let settings = load_proxy_settings_from_data_dir(&context.storage.data_dir).unwrap_or_default();
     let (upstream_payload, downstream_stream) =
-        match convert_openai_chat_request_to_codex(&request_json) {
+        match convert_openai_chat_request_to_codex(&request_json, &settings) {
             Ok(value) => value,
-            Err(message) => return invalid_request_response(&message),
+            Err(message) => {
+                let response = invalid_request_response(&message);
+                let status = response.status();
+                record_proxy_audit(
+                    &context,
+                    build_access_entry("POST", path, client_ip, status, started_at, None, None, None),
+                    Some(build_error_entry(path, status, message)),
+                    None,
+                )
+                .await;
+                return response;
+            }
         };
+    let resolved_model = upstream_payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_PROXY_MODEL)
+        .to_string();
+    let request_summary =
+        summarize_chat_request_for_debug(&request_json, &resolved_model, downstream_stream);
 
     let upstream =
         match send_codex_request_over_candidates(&context, &headers, &upstream_payload).await {
             Ok(value) => value,
-            Err(response) => return response,
+            Err(response) => {
+                let status = response.status();
+                let message = snapshot_last_proxy_error(&context)
+                    .await
+                    .unwrap_or_else(|| "Proxy upstream request failed.".to_string());
+                record_proxy_audit(
+                    &context,
+                    build_access_entry(
+                        "POST",
+                        path,
+                        client_ip,
+                        status,
+                        started_at,
+                        Some(&resolved_model),
+                        Some(downstream_stream),
+                        None,
+                    ),
+                    Some(build_error_entry(path, status, message.clone())),
+                    Some(ProxyAuditDebugEntry {
+                        timestamp: current_timestamp_rfc3339(),
+                        path: path.to_string(),
+                        request_summary,
+                        response_summary: json!({
+                            "error": message,
+                            "stream": downstream_stream,
+                        }),
+                    }),
+                )
+                .await;
+                return response;
+            }
         };
 
     let (candidate, upstream_response) = upstream;
+    let upstream_status = upstream_response.status();
+    let upstream_request_id = extract_upstream_request_id(upstream_response.headers());
     update_proxy_target(&context, &candidate).await;
     update_proxy_error(&context, None).await;
 
     if downstream_stream {
+        record_proxy_audit(
+            &context,
+            build_access_entry(
+                "POST",
+                path,
+                client_ip,
+                upstream_status,
+                started_at,
+                Some(&resolved_model),
+                Some(true),
+                upstream_request_id,
+            ),
+            None,
+            Some(ProxyAuditDebugEntry {
+                timestamp: current_timestamp_rfc3339(),
+                path: path.to_string(),
+                request_summary,
+                response_summary: json!({
+                    "stream": true,
+                    "candidateAccount": candidate.label,
+                }),
+            }),
+        )
+        .await;
         build_chat_streaming_response(upstream_response)
     } else {
         let upstream_headers = upstream_response.headers().clone();
@@ -472,7 +1025,30 @@ async fn chat_completions_handler(
             Err(error) => {
                 let message = format!("读取 Codex 上游响应失败: {error}");
                 update_proxy_error(&context, Some(message.clone())).await;
-                return json_error_response(StatusCode::BAD_GATEWAY, &message);
+                let response = json_error_response(StatusCode::BAD_GATEWAY, &message);
+                let status = response.status();
+                record_proxy_audit(
+                    &context,
+                    build_access_entry(
+                        "POST",
+                        path,
+                        client_ip,
+                        status,
+                        started_at,
+                        Some(&resolved_model),
+                        Some(false),
+                        upstream_request_id,
+                    ),
+                    Some(build_error_entry(path, status, message.clone())),
+                    Some(ProxyAuditDebugEntry {
+                        timestamp: current_timestamp_rfc3339(),
+                        path: path.to_string(),
+                        request_summary,
+                        response_summary: json!({ "error": message }),
+                    }),
+                )
+                .await;
+                return response;
             }
         };
 
@@ -480,7 +1056,30 @@ async fn chat_completions_handler(
             Ok(value) => value,
             Err(message) => {
                 update_proxy_error(&context, Some(message.clone())).await;
-                return json_error_response(StatusCode::BAD_GATEWAY, &message);
+                let response = json_error_response(StatusCode::BAD_GATEWAY, &message);
+                let status = response.status();
+                record_proxy_audit(
+                    &context,
+                    build_access_entry(
+                        "POST",
+                        path,
+                        client_ip,
+                        status,
+                        started_at,
+                        Some(&resolved_model),
+                        Some(false),
+                        upstream_request_id,
+                    ),
+                    Some(build_error_entry(path, status, message.clone())),
+                    Some(ProxyAuditDebugEntry {
+                        timestamp: current_timestamp_rfc3339(),
+                        path: path.to_string(),
+                        request_summary,
+                        response_summary: json!({ "error": message }),
+                    }),
+                )
+                .await;
+                return response;
             }
         };
 
@@ -490,45 +1089,195 @@ async fn chat_completions_handler(
                 Err(error) => {
                     let message = format!("序列化聊天响应失败: {error}");
                     update_proxy_error(&context, Some(message.clone())).await;
-                    return json_error_response(StatusCode::BAD_GATEWAY, &message);
+                    let response = json_error_response(StatusCode::BAD_GATEWAY, &message);
+                    let status = response.status();
+                    record_proxy_audit(
+                        &context,
+                        build_access_entry(
+                            "POST",
+                            path,
+                            client_ip,
+                            status,
+                            started_at,
+                            Some(&resolved_model),
+                            Some(false),
+                            upstream_request_id,
+                        ),
+                        Some(build_error_entry(path, status, message.clone())),
+                        Some(ProxyAuditDebugEntry {
+                            timestamp: current_timestamp_rfc3339(),
+                            path: path.to_string(),
+                            request_summary,
+                            response_summary: json!({ "error": message }),
+                        }),
+                    )
+                    .await;
+                    return response;
                 }
             };
 
-        build_json_proxy_response(StatusCode::OK, &upstream_headers, body)
+        let debug_summary = summarize_chat_response_for_debug(&completed);
+        let response = build_json_proxy_response(StatusCode::OK, &upstream_headers, body);
+        record_proxy_audit(
+            &context,
+            build_access_entry(
+                "POST",
+                path,
+                client_ip,
+                response.status(),
+                started_at,
+                Some(&resolved_model),
+                Some(false),
+                upstream_request_id,
+            ),
+            None,
+            Some(ProxyAuditDebugEntry {
+                timestamp: current_timestamp_rfc3339(),
+                path: path.to_string(),
+                request_summary,
+                response_summary: debug_summary,
+            }),
+        )
+        .await;
+
+        response
     }
 }
 
 async fn responses_handler(
     State(context): State<Arc<ProxyContext>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
+    let started_at = std::time::Instant::now();
+    let path = "/v1/responses";
+    let client_ip = client_ip_from_connect_info(connect_info.as_ref());
+
     if let Some(response) = ensure_authorized(&headers, &context.api_key) {
+        let status = response.status();
+        record_proxy_audit(
+            &context,
+            build_access_entry("POST", path, client_ip, status, started_at, None, None, None),
+            Some(build_error_entry(
+                path,
+                status,
+                "Invalid proxy api key.".to_string(),
+            )),
+            None,
+        )
+        .await;
         return response;
     }
 
-    let request_json = match parse_json_request(&body) {
+    let request_json = match parse_json_request_message(&body) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(message) => {
+            let response = invalid_request_response(&message);
+            let status = response.status();
+            record_proxy_audit(
+                &context,
+                build_access_entry("POST", path, client_ip, status, started_at, None, None, None),
+                Some(build_error_entry(path, status, message)),
+                None,
+            )
+            .await;
+            return response;
+        }
     };
 
+    let settings = load_proxy_settings_from_data_dir(&context.storage.data_dir).unwrap_or_default();
     let (upstream_payload, downstream_stream) =
-        match normalize_openai_responses_request(request_json) {
+        match normalize_openai_responses_request(request_json.clone(), &settings) {
             Ok(value) => value,
-            Err(message) => return invalid_request_response(&message),
+            Err(message) => {
+                let response = invalid_request_response(&message);
+                let status = response.status();
+                record_proxy_audit(
+                    &context,
+                    build_access_entry("POST", path, client_ip, status, started_at, None, None, None),
+                    Some(build_error_entry(path, status, message)),
+                    None,
+                )
+                .await;
+                return response;
+            }
         };
+    let resolved_model = upstream_payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_PROXY_MODEL)
+        .to_string();
+    let request_summary =
+        summarize_responses_request_for_debug(&request_json, &resolved_model, downstream_stream);
 
     let upstream =
         match send_codex_request_over_candidates(&context, &headers, &upstream_payload).await {
             Ok(value) => value,
-            Err(response) => return response,
+            Err(response) => {
+                let status = response.status();
+                let message = snapshot_last_proxy_error(&context)
+                    .await
+                    .unwrap_or_else(|| "Proxy upstream request failed.".to_string());
+                record_proxy_audit(
+                    &context,
+                    build_access_entry(
+                        "POST",
+                        path,
+                        client_ip,
+                        status,
+                        started_at,
+                        Some(&resolved_model),
+                        Some(downstream_stream),
+                        None,
+                    ),
+                    Some(build_error_entry(path, status, message.clone())),
+                    Some(ProxyAuditDebugEntry {
+                        timestamp: current_timestamp_rfc3339(),
+                        path: path.to_string(),
+                        request_summary,
+                        response_summary: json!({
+                            "error": message,
+                            "stream": downstream_stream,
+                        }),
+                    }),
+                )
+                .await;
+                return response;
+            }
         };
 
     let (candidate, upstream_response) = upstream;
+    let upstream_status = upstream_response.status();
+    let upstream_request_id = extract_upstream_request_id(upstream_response.headers());
     update_proxy_target(&context, &candidate).await;
     update_proxy_error(&context, None).await;
 
     if downstream_stream {
+        record_proxy_audit(
+            &context,
+            build_access_entry(
+                "POST",
+                path,
+                client_ip,
+                upstream_status,
+                started_at,
+                Some(&resolved_model),
+                Some(true),
+                upstream_request_id,
+            ),
+            None,
+            Some(ProxyAuditDebugEntry {
+                timestamp: current_timestamp_rfc3339(),
+                path: path.to_string(),
+                request_summary,
+                response_summary: json!({
+                    "stream": true,
+                    "candidateAccount": candidate.label,
+                }),
+            }),
+        )
+        .await;
         build_passthrough_sse_response(upstream_response)
     } else {
         let upstream_headers = upstream_response.headers().clone();
@@ -537,7 +1286,30 @@ async fn responses_handler(
             Err(error) => {
                 let message = format!("读取 Codex 上游响应失败: {error}");
                 update_proxy_error(&context, Some(message.clone())).await;
-                return json_error_response(StatusCode::BAD_GATEWAY, &message);
+                let response = json_error_response(StatusCode::BAD_GATEWAY, &message);
+                let status = response.status();
+                record_proxy_audit(
+                    &context,
+                    build_access_entry(
+                        "POST",
+                        path,
+                        client_ip,
+                        status,
+                        started_at,
+                        Some(&resolved_model),
+                        Some(false),
+                        upstream_request_id,
+                    ),
+                    Some(build_error_entry(path, status, message.clone())),
+                    Some(ProxyAuditDebugEntry {
+                        timestamp: current_timestamp_rfc3339(),
+                        path: path.to_string(),
+                        request_summary,
+                        response_summary: json!({ "error": message }),
+                    }),
+                )
+                .await;
+                return response;
             }
         };
 
@@ -545,7 +1317,30 @@ async fn responses_handler(
             Ok(value) => value,
             Err(message) => {
                 update_proxy_error(&context, Some(message.clone())).await;
-                return json_error_response(StatusCode::BAD_GATEWAY, &message);
+                let response = json_error_response(StatusCode::BAD_GATEWAY, &message);
+                let status = response.status();
+                record_proxy_audit(
+                    &context,
+                    build_access_entry(
+                        "POST",
+                        path,
+                        client_ip,
+                        status,
+                        started_at,
+                        Some(&resolved_model),
+                        Some(false),
+                        upstream_request_id,
+                    ),
+                    Some(build_error_entry(path, status, message.clone())),
+                    Some(ProxyAuditDebugEntry {
+                        timestamp: current_timestamp_rfc3339(),
+                        path: path.to_string(),
+                        request_summary,
+                        response_summary: json!({ "error": message }),
+                    }),
+                )
+                .await;
+                return response;
             }
         };
 
@@ -555,16 +1350,64 @@ async fn responses_handler(
             Err(error) => {
                 let message = format!("序列化 responses 响应失败: {error}");
                 update_proxy_error(&context, Some(message.clone())).await;
-                return json_error_response(StatusCode::BAD_GATEWAY, &message);
+                let response = json_error_response(StatusCode::BAD_GATEWAY, &message);
+                let status = response.status();
+                record_proxy_audit(
+                    &context,
+                    build_access_entry(
+                        "POST",
+                        path,
+                        client_ip,
+                        status,
+                        started_at,
+                        Some(&resolved_model),
+                        Some(false),
+                        upstream_request_id,
+                    ),
+                    Some(build_error_entry(path, status, message.clone())),
+                    Some(ProxyAuditDebugEntry {
+                        timestamp: current_timestamp_rfc3339(),
+                        path: path.to_string(),
+                        request_summary,
+                        response_summary: json!({ "error": message }),
+                    }),
+                )
+                .await;
+                return response;
             }
         };
 
-        build_json_proxy_response(StatusCode::OK, &upstream_headers, body)
+        let debug_summary = summarize_responses_response_for_debug(&completed);
+        let response = build_json_proxy_response(StatusCode::OK, &upstream_headers, body);
+        record_proxy_audit(
+            &context,
+            build_access_entry(
+                "POST",
+                path,
+                client_ip,
+                response.status(),
+                started_at,
+                Some(&resolved_model),
+                Some(false),
+                upstream_request_id,
+            ),
+            None,
+            Some(ProxyAuditDebugEntry {
+                timestamp: current_timestamp_rfc3339(),
+                path: path.to_string(),
+                request_summary,
+                response_summary: debug_summary,
+            }),
+        )
+        .await;
+
+        response
     }
 }
 
 async fn unsupported_proxy_handler(
     State(context): State<Arc<ProxyContext>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     method: Method,
     uri: Uri,
@@ -573,17 +1416,65 @@ async fn unsupported_proxy_handler(
         return health_handler().await.into_response();
     }
 
+    let started_at = std::time::Instant::now();
+    let path = uri.path().to_string();
+    let client_ip = client_ip_from_connect_info(connect_info.as_ref());
+
     if let Some(response) = ensure_authorized(&headers, &context.api_key) {
+        let status = response.status();
+        record_proxy_audit(
+            &context,
+            build_access_entry(
+                method.as_str(),
+                &path,
+                client_ip,
+                status,
+                started_at,
+                None,
+                None,
+                None,
+            ),
+            Some(build_error_entry(
+                &path,
+                status,
+                "Invalid proxy api key.".to_string(),
+            )),
+            None,
+        )
+        .await;
         return response;
     }
 
-    json_error_response(
+    let message = format!(
+        "当前反代只支持 GET /v1/models、POST /v1/chat/completions、POST /v1/responses，收到的是 {method} {}",
+        uri.path()
+    );
+    let response = json_error_response(
         StatusCode::NOT_FOUND,
         &format!(
             "当前反代只支持 GET /v1/models、POST /v1/chat/completions、POST /v1/responses，收到的是 {method} {}",
             uri.path()
         ),
+    );
+    let status = response.status();
+    record_proxy_audit(
+        &context,
+        build_access_entry(
+            method.as_str(),
+            &path,
+            client_ip,
+            status,
+            started_at,
+            None,
+            None,
+            None,
+        ),
+        Some(build_error_entry(&path, status, message)),
+        None,
     )
+    .await;
+
+    response
 }
 
 fn ensure_authorized(headers: &HeaderMap, api_key: &Arc<RwLock<String>>) -> Option<Response<Body>> {
@@ -602,6 +1493,11 @@ fn parse_json_request(body: &Bytes) -> Result<Value, Response<Body>> {
         .map_err(|error| invalid_request_response(&format!("请求体不是合法 JSON: {error}")))
 }
 
+fn parse_json_request_message(body: &Bytes) -> Result<Value, String> {
+    serde_json::from_slice::<Value>(body)
+        .map_err(|error| format!("请求体不是合法 JSON: {error}"))
+}
+
 fn invalid_request_response(message: &str) -> Response<Body> {
     let mut response = Json(json!({
         "error": {
@@ -614,7 +1510,10 @@ fn invalid_request_response(message: &str) -> Response<Body> {
     response
 }
 
-fn convert_openai_chat_request_to_codex(request: &Value) -> Result<(Value, bool), String> {
+fn convert_openai_chat_request_to_codex(
+    request: &Value,
+    settings: &ProxySettings,
+) -> Result<(Value, bool), String> {
     let request_object = request
         .as_object()
         .ok_or_else(|| "聊天请求必须是 JSON 对象".to_string())?;
@@ -626,10 +1525,13 @@ fn convert_openai_chat_request_to_codex(request: &Value) -> Result<(Value, bool)
         .is_none()
         && request_object.contains_key("input")
     {
-        return normalize_openai_responses_request(request.clone());
+        return normalize_openai_responses_request(request.clone(), settings);
     }
 
-    let model = map_client_model_to_upstream(&required_string(request_object, "model")?)?;
+    let model = match request_object.get("model").and_then(Value::as_str) {
+        Some(model) => map_client_model_to_upstream(model)?,
+        None => settings.default_model.clone(),
+    };
     let messages = request_object
         .get("messages")
         .and_then(Value::as_array)
@@ -667,7 +1569,7 @@ fn convert_openai_chat_request_to_codex(request: &Value) -> Result<(Value, bool)
                 .get("reasoning_effort")
                 .and_then(Value::as_str)
                 .or_else(|| request_object.get("reasoning").and_then(|value| value.get("effort")).and_then(Value::as_str))
-                .unwrap_or("medium"),
+                .unwrap_or(settings.default_effort.as_str()),
             "summary": request_object
                 .get("reasoning")
                 .and_then(|value| value.get("summary"))
@@ -814,12 +1716,18 @@ fn convert_openai_chat_request_to_codex(request: &Value) -> Result<(Value, bool)
     Ok((Value::Object(root), downstream_stream))
 }
 
-fn normalize_openai_responses_request(mut request: Value) -> Result<(Value, bool), String> {
+fn normalize_openai_responses_request(
+    mut request: Value,
+    settings: &ProxySettings,
+) -> Result<(Value, bool), String> {
     let object = request
         .as_object_mut()
         .ok_or_else(|| "responses 请求必须是 JSON 对象".to_string())?;
 
-    let model = map_client_model_to_upstream(&required_string(object, "model")?)?;
+    let model = match object.get("model").and_then(Value::as_str) {
+        Some(model) => map_client_model_to_upstream(model)?,
+        None => settings.default_model.clone(),
+    };
     let downstream_stream = object
         .get("stream")
         .and_then(Value::as_bool)
@@ -843,7 +1751,10 @@ fn normalize_openai_responses_request(mut request: Value) -> Result<(Value, bool
     }
     if let Some(reasoning_object) = reasoning.as_object_mut() {
         if !reasoning_object.contains_key("effort") {
-            reasoning_object.insert("effort".to_string(), Value::String("medium".to_string()));
+            reasoning_object.insert(
+                "effort".to_string(),
+                Value::String(settings.default_effort.clone()),
+            );
         }
         if !reasoning_object.contains_key("summary") {
             reasoning_object.insert("summary".to_string(), Value::String("auto".to_string()));
@@ -2753,11 +3664,18 @@ fn parse_proxy_request_body_limit_mib(value: Option<&str>) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use super::append_proxy_audit_logs;
     use super::convert_completed_response_to_chat_completion;
     use super::convert_openai_chat_request_to_codex;
     use super::extract_completed_response_from_sse;
+    use super::load_proxy_settings_from_data_dir;
     use super::normalize_openai_responses_request;
     use super::parse_proxy_request_body_limit_mib;
+    use super::ProxyAuditAccessEntry;
+    use super::ProxyAuditDebugEntry;
+    use super::ProxyAuditErrorEntry;
+    use super::ProxyAuditLogLevel;
+    use super::ProxySettings;
     use super::resolve_proxy_request_body_limit_bytes_from_mib_value;
     use super::rewrite_response_models_for_client;
     use super::rewrite_sse_event_data_models_for_client;
@@ -2766,6 +3684,15 @@ mod tests {
     use super::SseEvent;
     use super::DEFAULT_PROXY_REQUEST_BODY_LIMIT_BYTES;
     use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("codex-tools-proxy-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     #[test]
     fn converts_chat_request_to_codex_payload() {
@@ -2779,7 +3706,8 @@ mod tests {
         });
 
         let (payload, downstream_stream) =
-            convert_openai_chat_request_to_codex(&request).expect("payload should convert");
+            convert_openai_chat_request_to_codex(&request, &ProxySettings::default())
+                .expect("payload should convert");
 
         assert!(!downstream_stream);
         assert_eq!(
@@ -2812,6 +3740,49 @@ mod tests {
     }
 
     #[test]
+    fn uses_default_model_for_chat_request_when_model_is_missing() {
+        let request = json!({
+            "messages": [
+                { "role": "user", "content": "hello" }
+            ]
+        });
+
+        let (payload, _) = convert_openai_chat_request_to_codex(&request, &ProxySettings::default())
+            .expect("payload should use default model");
+
+        assert_eq!(
+            payload.get("model").and_then(|value| value.as_str()),
+            Some("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn uses_configured_default_effort_for_chat_request_when_effort_is_missing() {
+        let request = json!({
+            "messages": [
+                { "role": "user", "content": "hello" }
+            ]
+        });
+
+        let settings = ProxySettings {
+            default_model: "gpt-5.4".to_string(),
+            default_effort: "high".to_string(),
+            audit_log_level: ProxyAuditLogLevel::Basic,
+        };
+
+        let (payload, _) = convert_openai_chat_request_to_codex(&request, &settings)
+            .expect("payload should use default effort");
+
+        assert_eq!(
+            payload
+                .get("reasoning")
+                .and_then(|value| value.get("effort"))
+                .and_then(|value| value.as_str()),
+            Some("high")
+        );
+    }
+
+    #[test]
     fn maps_chat_request_model_alias_to_upstream() {
         let request = json!({
             "model": "gpt-5-4",
@@ -2820,12 +3791,65 @@ mod tests {
             ]
         });
 
-        let (payload, _) =
-            convert_openai_chat_request_to_codex(&request).expect("payload should convert");
+        let (payload, _) = convert_openai_chat_request_to_codex(&request, &ProxySettings::default())
+            .expect("payload should convert");
 
         assert_eq!(
             payload.get("model").and_then(|value| value.as_str()),
             Some("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn uses_default_model_for_responses_request_when_model_is_missing() {
+        let request = json!({
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "hello" }
+                    ]
+                }
+            ]
+        });
+
+        let (payload, _) = normalize_openai_responses_request(request, &ProxySettings::default())
+            .expect("request should use default model");
+
+        assert_eq!(
+            payload.get("model").and_then(|value| value.as_str()),
+            Some("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn uses_configured_default_effort_for_responses_request_when_effort_is_missing() {
+        let request = json!({
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "hello" }
+                    ]
+                }
+            ]
+        });
+
+        let settings = ProxySettings {
+            default_model: "gpt-5.4".to_string(),
+            default_effort: "high".to_string(),
+            audit_log_level: ProxyAuditLogLevel::Basic,
+        };
+
+        let (payload, _) = normalize_openai_responses_request(request, &settings)
+            .expect("request should use default effort");
+
+        assert_eq!(
+            payload
+                .get("reasoning")
+                .and_then(|value| value.get("effort"))
+                .and_then(|value| value.as_str()),
+            Some("high")
         );
     }
 
@@ -2837,7 +3861,8 @@ mod tests {
         });
 
         let (payload, downstream_stream) =
-            convert_openai_chat_request_to_codex(&request).expect("payload should convert");
+            convert_openai_chat_request_to_codex(&request, &ProxySettings::default())
+                .expect("payload should convert");
 
         assert!(!downstream_stream);
         assert_eq!(
@@ -2862,7 +3887,8 @@ mod tests {
         });
 
         let (payload, downstream_stream) =
-            normalize_openai_responses_request(request).expect("request should normalize");
+            normalize_openai_responses_request(request, &ProxySettings::default())
+                .expect("request should normalize");
 
         assert!(!downstream_stream);
         assert_eq!(
@@ -2881,8 +3907,8 @@ mod tests {
             }
         });
 
-        let (payload, _) =
-            normalize_openai_responses_request(request).expect("request should normalize");
+        let (payload, _) = normalize_openai_responses_request(request, &ProxySettings::default())
+            .expect("request should normalize");
 
         assert!(payload.get("metadata").is_none());
     }
@@ -2896,7 +3922,7 @@ mod tests {
             ]
         });
 
-        let error = convert_openai_chat_request_to_codex(&request)
+        let error = convert_openai_chat_request_to_codex(&request, &ProxySettings::default())
             .expect_err("request should require gpt-5-4 alias");
 
         assert!(error.contains("gpt-5-4"));
@@ -2909,7 +3935,7 @@ mod tests {
             "input": "hello"
         });
 
-        let error = normalize_openai_responses_request(request)
+        let error = normalize_openai_responses_request(request, &ProxySettings::default())
             .expect_err("request should require gpt-5-4 alias");
 
         assert!(error.contains("gpt-5-4"));
@@ -3158,5 +4184,114 @@ data: {"type":"response.completed","response":{"id":"resp_123","created_at":1,"m
             resolve_proxy_request_body_limit_bytes_from_mib_value(Some("1")),
             1024 * 1024
         );
+    }
+
+    #[test]
+    fn loads_proxy_settings_from_data_dir() {
+        let dir = temp_dir();
+        fs::write(
+            dir.join("proxy-settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "defaultModel": "gpt-5-mini",
+                "defaultEffort": "high",
+                "auditLogLevel": "debug"
+            }))
+            .expect("serialize settings"),
+        )
+        .expect("write settings");
+
+        let settings = load_proxy_settings_from_data_dir(&dir).expect("load proxy settings");
+
+        assert_eq!(settings.default_model, "gpt-5-mini");
+        assert_eq!(settings.default_effort, "high");
+        assert_eq!(settings.audit_log_level, ProxyAuditLogLevel::Debug);
+    }
+
+    #[test]
+    fn appends_basic_audit_logs_without_debug_file() {
+        let dir = temp_dir();
+        let settings = ProxySettings {
+            default_model: "gpt-5.4".to_string(),
+            default_effort: "high".to_string(),
+            audit_log_level: ProxyAuditLogLevel::Basic,
+        };
+
+        append_proxy_audit_logs(
+            &dir,
+            &settings,
+            &ProxyAuditAccessEntry {
+                timestamp: "2026-04-11T00:00:00Z".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                client_ip: Some("192.168.50.10".to_string()),
+                status_code: 200,
+                duration_ms: 123,
+                model: Some("gpt-5.4".to_string()),
+                stream: Some(false),
+                upstream_request_id: Some("req_123".to_string()),
+            },
+            Some(&ProxyAuditErrorEntry {
+                timestamp: "2026-04-11T00:00:00Z".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                status_code: 502,
+                message: "bad gateway".to_string(),
+            }),
+            Some(&ProxyAuditDebugEntry {
+                timestamp: "2026-04-11T00:00:00Z".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                request_summary: json!({ "messages": 1 }),
+                response_summary: json!({ "outputTextPreview": "hello" }),
+            }),
+        )
+        .expect("append logs");
+
+        let access_log = fs::read_to_string(dir.join("logs").join("access.jsonl"))
+            .expect("read access log");
+        let error_log =
+            fs::read_to_string(dir.join("logs").join("error.jsonl")).expect("read error log");
+
+        assert!(access_log.contains("\"path\":\"/v1/chat/completions\""));
+        assert!(error_log.contains("\"message\":\"bad gateway\""));
+        assert!(!dir.join("logs").join("debug.jsonl").exists());
+    }
+
+    #[test]
+    fn appends_debug_audit_logs_when_enabled() {
+        let dir = temp_dir();
+        let settings = ProxySettings {
+            default_model: "gpt-5.4".to_string(),
+            default_effort: "high".to_string(),
+            audit_log_level: ProxyAuditLogLevel::Debug,
+        };
+
+        append_proxy_audit_logs(
+            &dir,
+            &settings,
+            &ProxyAuditAccessEntry {
+                timestamp: "2026-04-11T00:00:00Z".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                client_ip: Some("192.168.50.10".to_string()),
+                status_code: 200,
+                duration_ms: 456,
+                model: Some("gpt-5-mini".to_string()),
+                stream: Some(true),
+                upstream_request_id: None,
+            },
+            None,
+            Some(&ProxyAuditDebugEntry {
+                timestamp: "2026-04-11T00:00:00Z".to_string(),
+                path: "/v1/responses".to_string(),
+                request_summary: json!({ "inputItems": 2 }),
+                response_summary: json!({ "stream": true }),
+            }),
+        )
+        .expect("append logs");
+
+        let debug_log =
+            fs::read_to_string(dir.join("logs").join("debug.jsonl")).expect("read debug log");
+
+        assert!(debug_log.contains("\"path\":\"/v1/responses\""));
+        assert!(debug_log.contains("\"inputItems\":2"));
     }
 }

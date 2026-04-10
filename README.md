@@ -108,6 +108,10 @@ npm run tauri dev
 
 API 反代详细链路见 [docs/api-proxy.md](docs/api-proxy.md)。
 
+### ASUS Merlin / DockRoot 部署
+
+路由器 `linux/arm64` 镜像打包与启动说明见 [packaging/dockroot-proxyd/README-dockroot.md](packaging/dockroot-proxyd/README-dockroot.md)。
+
 ## 打包与发布（简版）
 
 本项目已配置 GitHub Actions 自动发布（mac 双架构 + Windows）。
