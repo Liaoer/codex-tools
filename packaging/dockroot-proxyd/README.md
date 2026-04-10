@@ -51,9 +51,10 @@
 
 - DockRoot 和容器状态查看
 - URL 和 API Key 展示
+- 默认 Model / Effort / 审计日志级别配置
 - `accounts.json` / `auth.json` 页面导入
 - 拉取镜像、启动、停止、重启、删除容器
-- 查看运行日志
+- 查看运行日志、请求审计日志、错误日志
 
 ## 运行约定
 

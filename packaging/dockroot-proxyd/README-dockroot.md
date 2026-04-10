@@ -21,9 +21,10 @@ That plugin adds:
 
 - DockRoot and container status display
 - URL and API key display
+- default model / effort / audit log level configuration
 - `accounts.json` / `auth.json` import from the page
 - image pull, start, stop, restart, remove, and key refresh actions
-- runtime log viewing
+- runtime log, request audit log, and error log viewing
 
 ## Directory layout
 
