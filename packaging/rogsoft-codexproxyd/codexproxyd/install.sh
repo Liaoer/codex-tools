@@ -35,7 +35,7 @@ platform_test() {
 }
 
 install_now() {
-	local plver current_enable current_disk_path current_data_dir current_image_ref current_default_model current_default_effort current_audit_log_level current_last_error current_last_import_at
+	local plver current_enable current_disk_path current_data_dir current_image_ref current_default_model current_default_effort current_audit_log_level current_last_error current_last_import_at current_last_pulled_image_ref current_last_pull_at
 	plver=$(cat "${DIR}/version")
 	current_enable=$(dbus get ${module}_enable)
 	current_disk_path=$(dbus get ${module}_disk_path_selected)
@@ -46,6 +46,8 @@ install_now() {
 	current_audit_log_level=$(dbus get ${module}_audit_log_level)
 	current_last_error=$(dbus get ${module}_last_error)
 	current_last_import_at=$(dbus get ${module}_last_import_at)
+	current_last_pulled_image_ref=$(dbus get ${module}_last_pulled_image_ref)
+	current_last_pull_at=$(dbus get ${module}_last_pull_at)
 
 	mkdir -p /koolshare/webs /koolshare/res /koolshare/scripts /koolshare/init.d
 	cp -f "/tmp/${module}/webs/Module_${module}.asp" /koolshare/webs/
@@ -57,13 +59,15 @@ install_now() {
 	ln -sf "/koolshare/scripts/${module}_action.sh" "/koolshare/init.d/S96${module}.sh"
 
 	[ -z "${current_enable}" ] && current_enable="0"
-	[ -z "${current_default_model}" ] && current_default_model="gpt-5.4"
+[ -z "${current_default_model}" ] && current_default_model="gpt-5-4"
 	[ -z "${current_default_effort}" ] && current_default_effort="high"
 	[ -z "${current_audit_log_level}" ] && current_audit_log_level="basic"
 	dbus set ${module}_enable="${current_enable}"
 	dbus set ${module}_disk_path_selected="${current_disk_path}"
 	dbus set ${module}_data_dir_value="${current_data_dir}"
 	dbus set ${module}_image_ref="${current_image_ref}"
+	dbus set ${module}_last_pulled_image_ref="${current_last_pulled_image_ref}"
+	dbus set ${module}_last_pull_at="${current_last_pull_at}"
 	dbus set ${module}_default_model="${current_default_model}"
 	dbus set ${module}_default_effort="${current_default_effort}"
 	dbus set ${module}_audit_log_level="${current_audit_log_level}"

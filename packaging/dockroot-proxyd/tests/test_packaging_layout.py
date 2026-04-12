@@ -26,6 +26,14 @@ class PackagingLayoutTests(unittest.TestCase):
         self.assertIn("CODEX_TOOLS_PROXY_LOG_MAX_BYTES", dockerfile)
         self.assertIn("CODEX_TOOLS_PROXY_MAX_UPSTREAM_BYTES", dockerfile)
 
+    def test_readme_keeps_merlin_plugin_as_separate_extension(self):
+        readme = (PACKAGE_ROOT / "README-dockroot.md").read_text(encoding="utf-8")
+
+        self.assertIn("Optional Merlin control panel", readme)
+        self.assertIn("packaging/rogsoft-codexproxyd", readme)
+        self.assertIn("documented separately", readme)
+        self.assertNotIn("image pull, start, stop, restart, remove, and key refresh actions", readme)
+
 
 if __name__ == "__main__":
     unittest.main()

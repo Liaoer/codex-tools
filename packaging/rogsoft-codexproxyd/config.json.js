@@ -1,7 +1,7 @@
 {
     "module": "codexproxyd",
     "version": "0.1.0",
-    "md5": "2b4e08ef4dc3f942ae4e54755e15509f",
+    "md5": "18326ac4f05e344b360fd8c03c9e19e4",
     "home_url": "Module_codexproxyd.asp",
     "title": "codexproxyd",
     "description": "DockRoot control panel for codex-tools-proxyd",
@@ -9,5 +9,5 @@
     "author": "Codex",
     "link": "",
     "changelog": "",
-    "build_date": "2026-04-12_03:12:20"
+    "build_date": "2026-04-13_04:24:58"
 }

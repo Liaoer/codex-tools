@@ -7,7 +7,7 @@ eval $(dbus export codexproxyd)
 
 CONTAINER_NAME="codexproxyd"
 PORT="8787"
-DEFAULT_MODEL="gpt-5.4"
+DEFAULT_MODEL="gpt-5-4"
 DEFAULT_EFFORT="high"
 DEFAULT_AUDIT_LOG_LEVEL="basic"
 LOG_FILE="/tmp/upload/codexproxyd_log.txt"
@@ -15,6 +15,7 @@ ACTION_PID_FILE="/tmp/codexproxyd_action.pid"
 ACTION_STATE_FILE="/tmp/codexproxyd_action.state"
 BOOT_ACTION="${ACTION:-$1}"
 ACTION_NAME="${codexproxyd_action:-${2:-$1}}"
+IMPORT_STAGE_ROOT="/tmp/codexproxyd-import"
 coalesce_setting_value() {
 	local preferred="$1"
 	local fallback="$2"
@@ -46,6 +47,14 @@ TMP_USAGE_SUMMARY="/tmp/${CONTAINER_NAME}_usage_summary.json"
 TMP_IMPORTED_USAGE_SUMMARY="/tmp/${CONTAINER_NAME}_imported_usage_summary.json"
 REQUEST_ID="${codexproxyd_request_id}"
 HTTP_CLIENT=""
+STAGE_ID="${codexproxyd_stage_id}"
+STAGE_TARGET="${codexproxyd_stage_target}"
+STAGE_CHUNK_INDEX="${codexproxyd_stage_chunk_index}"
+STAGE_TOTAL_CHUNKS="${codexproxyd_stage_total_chunks}"
+DATA_DIR_RESOLVED_FROM="default"
+ACTION_STARTED_AT=""
+DOCKROOT_RENEW_TIMEOUT_SECONDS="12"
+DOCKROOT_START_TIMEOUT_SECONDS="15"
 
 set_last_error() {
 	dbus set codexproxyd_last_error="$1"
@@ -63,18 +72,30 @@ finish_log() {
 	echo "XU6J03M6" >> "${LOG_FILE}"
 }
 
+current_epoch() {
+	date +%s
+}
+
 write_action_state() {
 	local status="$1"
 	local message="$2"
 	local pid_value="$3"
+	local phase="$4"
+	local started_at="${ACTION_STARTED_AT}"
+	local updated_at
+	[ -n "${started_at}" ] || started_at="$(current_epoch)"
+	updated_at="$(current_epoch)"
 	mkdir -p /tmp
 	cat > "${ACTION_STATE_FILE}" <<-EOF
 	{
+	  "requestId": "$(json_escape "${REQUEST_ID}")",
 	  "name": "$(json_escape "${ACTION_NAME}")",
 	  "status": "$(json_escape "${status}")",
 	  "pid": "$(json_escape "${pid_value}")",
 	  "message": "$(json_escape "${message}")",
-	  "updatedAt": "$(TZ=UTC-8 date "+%Y-%m-%d %H:%M:%S")"
+	  "phase": "$(json_escape "${phase}")",
+	  "startedAt": "$(json_escape "${started_at}")",
+	  "updatedAt": "$(json_escape "${updated_at}")"
 	}
 	EOF
 	chmod 600 "${ACTION_STATE_FILE}" >/dev/null 2>&1
@@ -109,12 +130,25 @@ success_response_value() {
 	printf "%s" "$1"
 }
 
+ensure_request_id() {
+	if [ -n "${REQUEST_ID}" ]; then
+		return 0
+	fi
+	REQUEST_ID="$(current_epoch)$$"
+}
+
 refresh_runtime_paths() {
-	local default_data_dir resolved_data_dir
+	local default_data_dir resolved_runtime_data resolved_source resolved_data_dir
 	DOCKROOT_BIN="${DISK_PATH}/DockRootBin/DockRoot"
 	DOCKROOT_DATA_DIR="${DISK_PATH}/DockRootData/${CONTAINER_NAME}"
 	default_data_dir="${DISK_PATH}/codex-proxyd-data"
-	resolved_data_dir="$(resolve_runtime_data_dir "${default_data_dir}")"
+	resolved_runtime_data="$(resolve_runtime_data_dir "${default_data_dir}")"
+	resolved_source="${resolved_runtime_data%%|*}"
+	resolved_data_dir="${resolved_runtime_data#*|}"
+	if [ "${resolved_data_dir}" = "${resolved_runtime_data}" ]; then
+		resolved_source="default"
+	fi
+	DATA_DIR_RESOLVED_FROM="${resolved_source}"
 	DATA_DIR="${resolved_data_dir:-${default_data_dir}}"
 	ACCOUNTS_FILE="${DATA_DIR}/accounts.json"
 	API_KEY_FILE="${DATA_DIR}/api-proxy.key"
@@ -179,6 +213,18 @@ data_dir_score() {
 	[ -d "${candidate}/logs" ] && score=$((score + 5))
 	[ -d "${candidate}" ] && score=$((score + 1))
 	printf "%s" "${score}"
+}
+
+has_data_dir_evidence() {
+	local candidate="$1"
+	case "$(data_dir_score "${candidate}")" in
+		""|*[!0-9]*|0)
+			return 1
+			;;
+		*)
+			return 0
+			;;
+	esac
 }
 
 extract_runtime_data_dir_from_file() {
@@ -278,19 +324,32 @@ resolve_runtime_data_dir() {
 		extracted_path="$(extract_runtime_data_dir_from_file "${DOCKROOT_DATA_DIR}/ruri.conf")"
 	fi
 	if [ -n "${extracted_path}" ]; then
-		printf "%s" "${extracted_path}"
+		printf "runtime_config|%s" "${extracted_path}"
+		return 0
+	fi
+	if [ -n "${DATA_DIR_OVERRIDE}" ] && has_data_dir_evidence "${DATA_DIR_OVERRIDE}"; then
+		printf "saved_value|%s" "${DATA_DIR_OVERRIDE}"
 		return 0
 	fi
 	fallback_path="$(find_existing_data_dir)"
 	if [ -n "${fallback_path}" ]; then
-		printf "%s" "${fallback_path}"
+		printf "scan|%s" "${fallback_path}"
 		return 0
 	fi
-	if [ -n "${DATA_DIR_OVERRIDE}" ]; then
-		printf "%s" "${DATA_DIR_OVERRIDE}"
-		return 0
-	fi
-	printf "%s" "${default_data_dir}"
+	printf "default|%s" "${default_data_dir}"
+}
+
+persist_resolved_data_dir() {
+	case "${DATA_DIR_RESOLVED_FROM}" in
+		runtime_config|scan)
+			dbus set codexproxyd_data_dir_value="${DATA_DIR}"
+			;;
+		saved_value|default)
+			if has_data_dir_evidence "${DATA_DIR}"; then
+				dbus set codexproxyd_data_dir_value="${DATA_DIR}"
+			fi
+			;;
+	esac
 }
 
 ensure_disk_path() {
@@ -299,7 +358,8 @@ ensure_disk_path() {
 		codexproxyd_disk_path_selected="${DISK_PATH}"
 		dbus set codexproxyd_disk_path_selected="${DISK_PATH}"
 		refresh_runtime_paths
-		dbus set codexproxyd_data_dir_value="${DATA_DIR}"
+		persist_resolved_data_dir
+		restore_saved_settings_from_proxy_settings
 		return 0
 	fi
 	recovered_path="$(find_existing_disk_path)"
@@ -307,7 +367,8 @@ ensure_disk_path() {
 		recover_disk_path_from_accounts_file >/dev/null 2>&1 || true
 		if [ -n "${DISK_PATH}" ] && [ -d "${DISK_PATH}" ]; then
 			refresh_runtime_paths
-			dbus set codexproxyd_data_dir_value="${DATA_DIR}"
+			persist_resolved_data_dir
+			restore_saved_settings_from_proxy_settings
 			return 0
 		fi
 		recovered_path="$(find_existing_disk_path)"
@@ -317,7 +378,8 @@ ensure_disk_path() {
 		codexproxyd_disk_path_selected="${DISK_PATH}"
 		dbus set codexproxyd_disk_path_selected="${DISK_PATH}"
 		refresh_runtime_paths
-		dbus set codexproxyd_data_dir_value="${DATA_DIR}"
+		persist_resolved_data_dir
+		restore_saved_settings_from_proxy_settings
 		echo_date "Recovered disk path automatically: ${DISK_PATH}" >> "${LOG_FILE}"
 		return 0
 	fi
@@ -352,6 +414,8 @@ ensure_data_dir() {
 	mkdir -p "${DATA_DIR}"
 	chmod 700 "${DATA_DIR}" >/dev/null 2>&1
 	dbus set codexproxyd_data_dir_value="${DATA_DIR}"
+	refresh_runtime_paths
+	restore_saved_settings_from_proxy_settings
 }
 
 normalize_default_model() {
@@ -407,6 +471,38 @@ normalize_dockroot_image_ref() {
 	esac
 }
 
+read_proxy_settings_field() {
+	local field_name="$1"
+	[ -s "${PROXY_SETTINGS_FILE}" ] || return 0
+	sed -n "s/^.*\"${field_name}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*$/\\1/p" "${PROXY_SETTINGS_FILE}" 2>/dev/null | head -n1
+}
+
+restore_saved_settings_from_proxy_settings() {
+	local saved_image_ref saved_default_model saved_default_effort saved_audit_log_level
+	[ -s "${PROXY_SETTINGS_FILE}" ] || return 0
+	saved_image_ref="$(read_proxy_settings_field "imageRef")"
+	saved_default_model="$(read_proxy_settings_field "defaultModel")"
+	saved_default_effort="$(read_proxy_settings_field "defaultEffort")"
+	saved_audit_log_level="$(read_proxy_settings_field "auditLogLevel")"
+	if [ -z "${IMAGE_REF}" ] && [ -n "${saved_image_ref}" ]; then
+		IMAGE_REF="${saved_image_ref}"
+		codexproxyd_image_ref="${IMAGE_REF}"
+		dbus set codexproxyd_image_ref="${IMAGE_REF}"
+	fi
+	if [ -z "${DEFAULT_MODEL_VALUE}" ] && [ -n "${saved_default_model}" ]; then
+		DEFAULT_MODEL_VALUE="${saved_default_model}"
+		dbus set codexproxyd_default_model="$(normalize_default_model "${DEFAULT_MODEL_VALUE}")"
+	fi
+	if [ -z "${DEFAULT_EFFORT_VALUE}" ] && [ -n "${saved_default_effort}" ]; then
+		DEFAULT_EFFORT_VALUE="${saved_default_effort}"
+		dbus set codexproxyd_default_effort="$(normalize_default_effort "${DEFAULT_EFFORT_VALUE}")"
+	fi
+	if [ -z "${AUDIT_LOG_LEVEL_VALUE}" ] && [ -n "${saved_audit_log_level}" ]; then
+		AUDIT_LOG_LEVEL_VALUE="${saved_audit_log_level}"
+		dbus set codexproxyd_audit_log_level="$(normalize_audit_log_level "${AUDIT_LOG_LEVEL_VALUE}")"
+	fi
+}
+
 json_escape() {
 	printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -429,6 +525,7 @@ write_proxy_settings() {
 	normalized_audit_log_level=$(normalize_audit_log_level "${AUDIT_LOG_LEVEL_VALUE}")
 	cat > "${PROXY_SETTINGS_FILE}" <<-EOF
 	{
+	  "imageRef": "$(json_escape "${IMAGE_REF}")",
 	  "defaultModel": "$(json_escape "${normalized_model}")",
 	  "defaultEffort": "$(json_escape "${normalized_effort}")",
 	  "auditLogLevel": "$(json_escape "${normalized_audit_log_level}")"
@@ -467,13 +564,32 @@ ensure_http_client() {
 		HTTP_CLIENT="wget"
 		return 0
 	fi
-	fail_action "Neither curl nor wget is available on this system."
+	if command -v busybox >/dev/null 2>&1 && busybox wget --help >/dev/null 2>&1; then
+		HTTP_CLIENT="busybox_wget"
+		return 0
+	fi
+	if command -v nc >/dev/null 2>&1; then
+		HTTP_CLIENT="nc"
+		return 0
+	fi
+	if command -v busybox >/dev/null 2>&1 && busybox nc --help >/dev/null 2>&1; then
+		HTTP_CLIENT="busybox_nc"
+		return 0
+	fi
+	fail_action "No supported local HTTP client is available (curl/wget/nc)."
 	return 1
+}
+
+extract_http_body_to_file() {
+	local response_file="$1"
+	local output_path="$2"
+	awk 'BEGIN{body=0} body{print} /^\r?$/{body=1}' "${response_file}" | sed '1{/^\r\?$/d;}' > "${output_path}"
 }
 
 run_http_post_to_file() {
 	local url="$1"
 	local output_path="$2"
+	local request_path response_path status_code
 	if [ "${HTTP_CLIENT}" = "curl" ]; then
 		curl -sS -X POST -o "${output_path}" -w "%{http_code}" --max-time 180 "${url}" 2>> "${LOG_FILE}"
 		return $?
@@ -486,6 +602,30 @@ run_http_post_to_file() {
 		fi
 		return 1
 	fi
+	if [ "${HTTP_CLIENT}" = "busybox_wget" ]; then
+		busybox wget -q -O "${output_path}" --timeout=180 --post-data="" "${url}" >> "${LOG_FILE}" 2>&1
+		if [ "$?" = "0" ]; then
+			printf "200"
+			return 0
+		fi
+		return 1
+	fi
+	request_path="$(printf "%s" "${url}" | sed -n 's#^http://127\.0\.0\.1:[0-9]\+\(/.*\)$#\1#p')"
+	[ -n "${request_path}" ] || request_path="/"
+	response_path="${output_path}.http"
+	rm -f "${response_path}"
+	if [ "${HTTP_CLIENT}" = "nc" ]; then
+		printf "POST %s HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n" "${request_path}" "${PORT}" | nc -w 180 127.0.0.1 "${PORT}" > "${response_path}" 2>> "${LOG_FILE}" || return 1
+	elif [ "${HTTP_CLIENT}" = "busybox_nc" ]; then
+		printf "POST %s HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n" "${request_path}" "${PORT}" | busybox nc -w 180 127.0.0.1 "${PORT}" > "${response_path}" 2>> "${LOG_FILE}" || return 1
+	else
+		return 1
+	fi
+	status_code="$(sed -n '1s#^HTTP/[0-9.]* \([0-9][0-9][0-9]\).*$#\1#p' "${response_path}" | head -n1)"
+	extract_http_body_to_file "${response_path}" "${output_path}"
+	rm -f "${response_path}"
+	printf "%s" "${status_code:-000}"
+	return 0
 	return 1
 }
 
@@ -563,6 +703,55 @@ assert_runtime_stopped() {
 	return 0
 }
 
+run_mount_refresh() {
+	local renew_exit=0 renew_pid="" waited=0
+	echo_date "Refreshing mount config for ${CONTAINER_NAME}." >> "${LOG_FILE}"
+	if command -v timeout >/dev/null 2>&1; then
+		timeout "${DOCKROOT_RENEW_TIMEOUT_SECONDS}" "${DOCKROOT_BIN}" run -v "${DATA_DIR}:/data" --renew "${CONTAINER_NAME}" >> "${LOG_FILE}" 2>&1
+		renew_exit=$?
+	else
+		"${DOCKROOT_BIN}" run -v "${DATA_DIR}:/data" --renew "${CONTAINER_NAME}" >> "${LOG_FILE}" 2>&1 &
+		renew_pid=$!
+		while kill -0 "${renew_pid}" 2>/dev/null && [ "${waited}" -lt "${DOCKROOT_RENEW_TIMEOUT_SECONDS}" ]; do
+			sleep 1
+			waited=$((waited + 1))
+		done
+		if kill -0 "${renew_pid}" 2>/dev/null; then
+			kill -TERM "${renew_pid}" >/dev/null 2>&1 || true
+			renew_exit=124
+		else
+			wait "${renew_pid}"
+			renew_exit=$?
+		fi
+	fi
+	case "${renew_exit}" in
+		0)
+			return 0
+			;;
+		124|143)
+			if grep -q "upstream=codex" "${LOG_FILE}" || grep -q "listen=http://0.0.0.0:8787/v1" "${LOG_FILE}" || [ -f "${DOCKROOT_DATA_DIR}/ruri.conf" ] || [ -f "${DOCKROOT_DATA_DIR}/config.json" ]; then
+				echo_date "DockRoot run --renew stayed attached after reporting startup details. Continuing with detached startup." >> "${LOG_FILE}"
+				return 0
+			fi
+			;;
+	esac
+	fail_action "DockRoot run --renew failed."
+	return 1
+}
+
+wait_for_runtime_running() {
+	local waited=0
+	while [ "${waited}" -lt "${DOCKROOT_START_TIMEOUT_SECONDS}" ]; do
+		if is_runtime_running; then
+			echo_date "Container entered running state after detached start." >> "${LOG_FILE}"
+			return 0
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	return 1
+}
+
 ensure_runtime_available() {
 	if is_runtime_running; then
 		return 0
@@ -572,6 +761,7 @@ ensure_runtime_available() {
 }
 
 save_usage_summary() {
+	local previous_timestamp new_timestamp
 	if [ ! -s "${TMP_USAGE_SUMMARY}" ]; then
 		fail_action "Usage refresh returned an empty payload."
 		return 1
@@ -584,9 +774,47 @@ save_usage_summary() {
 			return 1
 			;;
 	esac
+	previous_timestamp="$(extract_accounts_usage_timestamp "${USAGE_SUMMARY_FILE}")"
+	new_timestamp="$(extract_accounts_usage_timestamp "${TMP_USAGE_SUMMARY}")"
+	case "${previous_timestamp}" in
+		""|*[!0-9]*)
+			previous_timestamp=0
+			;;
+	esac
+	case "${new_timestamp}" in
+		""|*[!0-9]*)
+			new_timestamp=0
+			;;
+	esac
+	if [ "${new_timestamp}" -gt "0" ] && [ "${previous_timestamp}" -gt "0" ] && [ "${new_timestamp}" -lt "${previous_timestamp}" ]; then
+		fail_action "Usage refresh returned a stale summary payload."
+		return 1
+	fi
 	cp -f "${TMP_USAGE_SUMMARY}" "${USAGE_SUMMARY_FILE}"
 	chmod 600 "${USAGE_SUMMARY_FILE}" >/dev/null 2>&1
 	return 0
+}
+
+extract_accounts_usage_timestamp() {
+	local source_file="$1"
+	[ -s "${source_file}" ] || {
+		printf "0"
+		return 0
+	}
+	awk '
+		BEGIN { max = 0 }
+		{
+			while (match($0, /"(updatedAt|fetchedAt)"[[:space:]]*:[[:space:]]*[0-9]+/)) {
+				value = substr($0, RSTART, RLENGTH)
+				gsub(/[^0-9]/, "", value)
+				if ((value + 0) > max) {
+					max = value + 0
+				}
+				$0 = substr($0, RSTART + RLENGTH)
+			}
+		}
+		END { printf "%d", max + 0 }
+	' "${source_file}" 2>/dev/null
 }
 
 read_chunked_field_value() {
@@ -692,7 +920,7 @@ save_accounts_payload() {
 	fi
 	mv -f "${TMP_ACCOUNTS}" "${ACCOUNTS_FILE}"
 	if [ -s "${TMP_IMPORTED_USAGE_SUMMARY}" ]; then
-		cp -f "${TMP_IMPORTED_USAGE_SUMMARY}" "${USAGE_SUMMARY_FILE}"
+		mv -f "${TMP_IMPORTED_USAGE_SUMMARY}" "${USAGE_SUMMARY_FILE}"
 		chmod 600 "${USAGE_SUMMARY_FILE}" >/dev/null 2>&1
 	else
 		rm -f "${USAGE_SUMMARY_FILE}"
@@ -701,6 +929,152 @@ save_accounts_payload() {
 	set_last_import_at
 	clear_last_error
 	echo_date "Saved accounts.json into ${ACCOUNTS_FILE}" >> "${LOG_FILE}"
+	return 0
+}
+
+sanitize_stage_id() {
+	local stage_id
+	stage_id="$(printf "%s" "$1" | tr -cd 'A-Za-z0-9._-')"
+	[ -n "${stage_id}" ] || return 1
+	printf "%s" "${stage_id}"
+}
+
+stage_directory_path() {
+	local stage_id="$1"
+	printf "/tmp/codexproxyd-import/${stage_id}"
+}
+
+stage_file_path() {
+	local stage_id="$1"
+	local stage_target="$2"
+	local stage_dir
+	stage_dir="$(stage_directory_path "${stage_id}")"
+	case "${stage_target}" in
+		payload)
+			printf "%s/payload.json" "${stage_dir}"
+			;;
+		usage_summary)
+			printf "%s/usage-summary.json" "${stage_dir}"
+			;;
+		meta)
+			printf "%s/meta" "${stage_dir}"
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+cleanup_import_stage_dir() {
+	local stage_id="$1"
+	[ -n "${stage_id}" ] || return 0
+	rm -rf "$(stage_directory_path "${stage_id}")"
+}
+
+read_stage_chunk_text() {
+	local chunk_text
+	chunk_text="${codexproxyd_stage_chunk_text}"
+	if [ -n "${chunk_text}" ]; then
+		printf "%s" "${chunk_text}"
+		return 0
+	fi
+	read_chunked_field_value "codexproxyd_stage_chunk_text"
+}
+
+import_stage_begin() {
+	local stage_id stage_dir
+	stage_id="$(sanitize_stage_id "$(coalesce_setting_value "${STAGE_ID}" "${REQUEST_ID}")")" || {
+		fail_action "Import stage id is invalid."
+		return 1
+	}
+	stage_dir="$(stage_directory_path "${stage_id}")"
+	cleanup_import_stage_dir "${stage_id}"
+	mkdir -p "${stage_dir}" || {
+		fail_action "Failed to create import stage directory."
+		return 1
+	}
+	: > "$(stage_file_path "${stage_id}" "payload")"
+	: > "$(stage_file_path "${stage_id}" "usage_summary")"
+	cat > "$(stage_file_path "${stage_id}" "meta")" <<-EOF
+	stageId=${stage_id}
+	createdAt=$(TZ=UTC-8 date "+%Y-%m-%d %H:%M:%S")
+	EOF
+	echo_date "Initialized staged import ${stage_id}." >> "${LOG_FILE}"
+	return 0
+}
+
+import_stage_chunk() {
+	local stage_id stage_dir stage_file chunk_text
+	stage_id="$(sanitize_stage_id "$(coalesce_setting_value "${STAGE_ID}" "${REQUEST_ID}")")" || {
+		fail_action "Import stage id is invalid."
+		return 1
+	}
+	stage_dir="$(stage_directory_path "${stage_id}")"
+	[ -d "${stage_dir}" ] || {
+		fail_action "Import stage ${stage_id} was not initialized."
+		return 1
+	}
+	case "${STAGE_TARGET}" in
+		payload|usage_summary)
+			;;
+		*)
+			fail_action "Import stage target is invalid."
+			return 1
+			;;
+	esac
+	chunk_text="$(read_stage_chunk_text)"
+	stage_file="$(stage_file_path "${stage_id}" "${STAGE_TARGET}")" || {
+		fail_action "Import stage target is invalid."
+		return 1
+	}
+	printf "%s" "${chunk_text}" >> "${stage_file}"
+	echo_date "Accepted ${STAGE_TARGET} chunk ${STAGE_CHUNK_INDEX}/${STAGE_TOTAL_CHUNKS} for ${stage_id}." >> "${LOG_FILE}"
+	return 0
+}
+
+import_stage_commit() {
+	local stage_id payload_stage_file usage_stage_file
+	stage_id="$(sanitize_stage_id "$(coalesce_setting_value "${STAGE_ID}" "${REQUEST_ID}")")" || {
+		fail_action "Import stage id is invalid."
+		return 1
+	}
+	payload_stage_file="$(stage_file_path "${stage_id}" "payload")"
+	usage_stage_file="$(stage_file_path "${stage_id}" "usage_summary")"
+	[ -s "${payload_stage_file}" ] || {
+		cleanup_import_stage_dir "${stage_id}"
+		fail_action "Import payload is empty."
+		return 1
+	}
+	ensure_disk_path || {
+		cleanup_import_stage_dir "${stage_id}"
+		return 1
+	}
+	cp -f "${payload_stage_file}" "${TMP_PAYLOAD}"
+	if [ -s "${usage_stage_file}" ]; then
+		cp -f "${usage_stage_file}" "${TMP_IMPORTED_USAGE_SUMMARY}"
+	else
+		rm -f "${TMP_IMPORTED_USAGE_SUMMARY}"
+	fi
+	validate_accounts_payload || {
+		cleanup_import_stage_dir "${stage_id}"
+		return 1
+	}
+	save_accounts_payload || {
+		cleanup_import_stage_dir "${stage_id}"
+		return 1
+	}
+	cleanup_import_stage_dir "${stage_id}"
+	echo_date "Staged accounts import finished. Running proxyd will pick up the new store on later requests." >> "${LOG_FILE}"
+	return 0
+}
+
+import_stage_abort() {
+	local stage_id
+	stage_id="$(sanitize_stage_id "$(coalesce_setting_value "${STAGE_ID}" "${REQUEST_ID}")")" || {
+		return 0
+	}
+	cleanup_import_stage_dir "${stage_id}"
+	echo_date "Aborted staged import ${stage_id}." >> "${LOG_FILE}"
 	return 0
 }
 
@@ -724,6 +1098,8 @@ pull_image() {
 	}
 
 	clear_last_error
+	dbus set codexproxyd_last_pulled_image_ref="${IMAGE_REF}"
+	dbus set codexproxyd_last_pull_at="$(current_epoch)"
 	echo_date "Image pull finished." >> "${LOG_FILE}"
 	return 0
 }
@@ -748,18 +1124,20 @@ start_container() {
 		return 1
 	fi
 
-	echo_date "Refreshing mount config for ${CONTAINER_NAME}." >> "${LOG_FILE}"
-	"${DOCKROOT_BIN}" run -v "${DATA_DIR}:/data" --renew "${CONTAINER_NAME}" >> "${LOG_FILE}" 2>&1 || {
-		fail_action "DockRoot run --renew failed."
-		return 1
-	}
+	run_mount_refresh || return 1
+	if is_runtime_running; then
+		assert_single_proxyd_process || return 1
+		clear_last_error
+		echo_date "Container is already running after mount refresh." >> "${LOG_FILE}"
+		return 0
+	fi
 
 	echo_date "Starting container ${CONTAINER_NAME}." >> "${LOG_FILE}"
 	"${DOCKROOT_BIN}" run -d "${CONTAINER_NAME}" >> "${LOG_FILE}" 2>&1 || {
 		fail_action "DockRoot run -d failed."
 		return 1
 	}
-	is_runtime_running || {
+	wait_for_runtime_running || {
 		fail_action "Container did not enter running state after start."
 		return 1
 	}
@@ -888,6 +1266,8 @@ regenerate_key() {
 save_settings() {
 	local normalized_api_key existing_api_key key_updated="0"
 	local current_disk_path current_image_ref current_default_model current_default_effort current_audit_log_level
+	ensure_disk_path || return 1
+	restore_saved_settings_from_proxy_settings
 	current_disk_path="$(coalesce_setting_value "${codexproxyd_disk_path_selected}" "${DISK_PATH}")"
 	current_image_ref="$(coalesce_setting_value "${codexproxyd_image_ref}" "${IMAGE_REF}")"
 	current_default_model="$(coalesce_setting_value "${codexproxyd_default_model}" "${DEFAULT_MODEL_VALUE}")"
@@ -904,7 +1284,6 @@ save_settings() {
 	DEFAULT_MODEL_VALUE="$(normalize_default_model "${current_default_model}")"
 	DEFAULT_EFFORT_VALUE="$(normalize_default_effort "${current_default_effort}")"
 	AUDIT_LOG_LEVEL_VALUE="$(normalize_audit_log_level "${current_audit_log_level}")"
-	ensure_disk_path || return 1
 	ensure_data_dir
 	write_proxy_settings
 	normalized_api_key="$(normalize_api_key_value "${CUSTOM_API_KEY_VALUE}")"
@@ -1011,6 +1390,18 @@ run_action_by_name() {
 		refresh_usage)
 			refresh_usage
 			;;
+		import_stage_begin)
+			import_stage_begin
+			;;
+		import_stage_chunk)
+			import_stage_chunk
+			;;
+		import_stage_commit)
+			import_stage_commit
+			;;
+		import_stage_abort)
+			import_stage_abort
+			;;
 		import_accounts|import_auth)
 			import_accounts_payload
 			;;
@@ -1023,22 +1414,28 @@ run_action_by_name() {
 start_async_action() {
 	local action_pid
 	wait_for_action_slot || return 1
+	ensure_request_id
+	ACTION_STARTED_AT="$(current_epoch)"
 	write_log_header
 	(
+		while [ ! -s "${ACTION_PID_FILE}" ]; do
+			sleep 1
+		done
+		write_action_state "running" "" "$(cat "${ACTION_PID_FILE}" 2>/dev/null)" "running"
 		run_action_by_name
 		ACTION_RESULT=$?
-		finish_log
 		if [ "${ACTION_RESULT}" = "0" ]; then
-			write_action_state "success" "$(last_meaningful_log_line)" ""
+			write_action_state "success" "$(last_meaningful_log_line)" "" "completed"
 		else
-			write_action_state "error" "$(last_meaningful_log_line)" ""
+			write_action_state "error" "$(last_meaningful_log_line)" "" "failed"
 		fi
 		rm -f "${ACTION_PID_FILE}"
+		finish_log
 		exit ${ACTION_RESULT}
 	) &
 	action_pid=$!
 	echo "${action_pid}" > "${ACTION_PID_FILE}"
-	write_action_state "running" "" "${action_pid}"
+	write_action_state "running" "" "${action_pid}" "accepted"
 	echo_date "Action ${ACTION_NAME} is running in background (pid ${action_pid})." >> "${LOG_FILE}"
 	return 0
 }

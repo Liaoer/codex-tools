@@ -1,75 +1,41 @@
 # codex-tools-proxyd for DockRoot
 
-这个目录提供 `codex-tools-proxyd` 的 DockRoot 容器包装层，用于在 ASUS Merlin 路由器上以轻量容器方式运行 OpenAI 兼容 API 反代。
+这个目录是 `codex-tools-proxyd` 的 DockRoot 容器包装层，对应原始“方案 2”的主线交付物。
 
-当前实现的核心目标是：
+它只负责最小可运行能力：
 
-- 监听 `0.0.0.0:8787`
-- 暴露 `/health`、`/v1/models`、`/v1/chat/completions`、`/v1/responses`
-- 把 `accounts.json` 和 `api-proxy.key` 持久化到 USB 数据目录
-- 不依赖 `systemd`
-- 不复用 Tauri 桌面 UI
-- 默认只面向局域网使用
+- 在路由器上监听 `0.0.0.0:8787`
+- 提供 `/health`、`/v1/models`、`/v1/chat/completions`、`/v1/responses`
+- 将 `accounts.json` 和 `api-proxy.key` 持久化到 USB 挂载目录
+- 提供 `auth.json -> accounts.json` 的本地导入脚本
+- 提供 DockRoot 构建、部署和排障说明
 
-## 当前状态
+它不负责：
 
-- 上游核心: `codex-tools-proxyd`
-- 目标平台: `linux/arm64`
-- 运行方式: `DockRoot`
-- 默认端口: `8787`
-- 已提供可选 Merlin 软件中心控制面板
+- 复用桌面版 Tauri UI
+- 修改 `codex-tools-proxyd` 核心协议逻辑
+- 把 Merlin 软件中心控制面板纳入方案 2 主线验收
 
-## 适用场景
+## 方案 2 主线边界
 
-- 你已经在梅林路由器上安装了 DockRoot
-- 你希望把 API 反代常驻运行在路由器，而不是桌面电脑
-- 你需要重启后可恢复、镜像升级后可复用的数据目录
-- 你可以接受先用 DockRoot 命令行方式运行，或者再叠加软件中心控制面板
+当前主线交付只包含这些内容：
 
-## 不适合的场景
+- `Dockerfile`
+- `docker-entrypoint.sh`
+- `scripts/import_auth_to_accounts.py`
+- `README-dockroot.md`
 
-- 你想直接复用桌面版 Tauri 管理界面
-- 你需要 `systemd`、SSH 一键部署、远程守护运维这一整套流程
-- 你希望默认暴露到公网
-- 你手里还没有可移植的 `accounts.json` 或完整 `auth.json`
-
-## 核心能力
-
-- 多阶段 Docker 构建，直接编译 `src-tauri/proxyd`
-- `alpine` 运行时镜像，便于在容器内排障
-- 启动前强制检查 `/data/accounts.json`
-- 持久化目录固定为 `/data`
-- 镜像内默认启用更保守的路由器保护参数
-  - `CODEX_TOOLS_PROXY_MAX_BODY_MIB=16`
-  - `CODEX_TOOLS_PROXY_MAX_CONCURRENT_REQUESTS=2`
-  - `CODEX_TOOLS_PROXY_LOG_MAX_BYTES=524288`
-  - `CODEX_TOOLS_PROXY_MAX_UPSTREAM_BYTES=8388608`
-- 提供本地 `auth.json -> accounts.json` 转换脚本
-
-## 可选软件中心控制面板
-
-除了纯 DockRoot 运行方式，仓库现在还提供一个可选的 Merlin 软件中心插件：
-
-- [../rogsoft-codexproxyd/README.md](../rogsoft-codexproxyd/README.md)
-
-这个插件可以在 Merlin 后台中完成：
-
-- DockRoot 和容器状态查看
-- URL 和 API Key 展示
-- 默认 Model / Effort / 审计日志级别配置
-- `accounts.json` / `auth.json` 页面导入
-- 拉取镜像、启动、停止、重启、删除容器
-- 查看运行日志、请求审计日志、错误日志
+这条主线的目标是交付“容器镜像 + 导入脚本 + 部署说明 + 最小测试”。
 
 ## 运行约定
 
-容器固定用下面的命令启动：
+固定启动命令：
 
 ```bash
 codex-tools-proxyd serve --data-dir /data --host 0.0.0.0 --port 8787 --no-sync-current-auth
 ```
 
-推荐挂载：
+推荐宿主机挂载：
 
 ```text
 /tmp/mnt/sda1/codex-proxyd-data:/data
@@ -81,16 +47,12 @@ codex-tools-proxyd serve --data-dir /data --host 0.0.0.0 --port 8787 --no-sync-c
 http://<router-lan-ip>:8787/v1
 ```
 
-## 目录说明
+镜像默认包含较保守的路由器保护参数：
 
-- `Dockerfile`
-  - 构建 `linux/arm64` 镜像
-- `docker-entrypoint.sh`
-  - 启动前检查 `/data/accounts.json`
-- `scripts/import_auth_to_accounts.py`
-  - 把可移植 `auth.json` 转成单账号 `accounts.json`
-- `README-dockroot.md`
-  - 更详细的构建、部署、验证说明
+- `CODEX_TOOLS_PROXY_MAX_BODY_MIB=16`
+- `CODEX_TOOLS_PROXY_MAX_CONCURRENT_REQUESTS=2`
+- `CODEX_TOOLS_PROXY_LOG_MAX_BYTES=524288`
+- `CODEX_TOOLS_PROXY_MAX_UPSTREAM_BYTES=8388608`
 
 ## 快速开始
 
@@ -107,21 +69,17 @@ docker buildx build \
   .
 ```
 
-`<public-image-ref>` 指的是完整镜像引用，也就是“仓库地址:标签”。
-
-例如：
+`<public-image-ref>` 指完整镜像引用，例如：
 
 ```text
 ghcr.io/liaoer/codex-tools-proxyd:latest
 ```
 
-如果你使用 Merlin 面板，这个值也就是页面里“镜像地址”应该填写的内容。
-
 ### 2. 准备账号数据
 
 优先使用桌面版 `codex-tools` 已导出的 `accounts.json`。
 
-如果只有完整 `auth.json`，可以先在本机转换：
+如果只有完整 `auth.json`，可先在本机转换：
 
 ```bash
 python packaging/dockroot-proxyd/scripts/import_auth_to_accounts.py \
@@ -144,6 +102,7 @@ cd /tmp/mnt/sda1/DockRootBin
 ./DockRoot pull <public-image-ref> codexproxyd
 ./DockRoot run -v /tmp/mnt/sda1/codex-proxyd-data:/data --renew codexproxyd
 ./DockRoot run -d codexproxyd
+./DockRoot ps codexproxyd
 ```
 
 ### 5. 验证状态
@@ -152,30 +111,15 @@ cd /tmp/mnt/sda1/DockRootBin
 curl http://127.0.0.1:8787/health
 ```
 
-## 已实现范围
+## 可选 Merlin 扩展
 
-- DockRoot 容器包装层
-- `arm64` 构建路径
-- 启动入口检查与固定启动参数
-- `auth.json -> accounts.json` 导入脚本
-- 详细部署文档
-- 可选 Merlin 软件中心控制面板
+仓库里另外提供了一个可选的 Merlin 软件中心扩展包：
 
-## 当前不包含
+- [../rogsoft-codexproxyd/README.md](../rogsoft-codexproxyd/README.md)
 
-- Tauri UI 复用
-- SSH 远程部署流程
-- `systemd` 管理
-- Cloudflare / DDNS / 公网接入
-
-## 下一步可扩展方向
-
-- 镜像升级检查和快速回滚
-- 更完整的 API 健康检查
-- 受控公网访问评估
-- 面板侧更多运维信息展示
+它不是方案 2 主线交付物。这个扩展包的界面能力、测试和验收口径都单独维护，不并入 DockRoot 主线定义。
 
 ## 文档入口
 
-- 详细部署说明: [README-dockroot.md](./README-dockroot.md)
-- 软件中心插件说明: [../rogsoft-codexproxyd/README.md](../rogsoft-codexproxyd/README.md)
+- 详细部署说明：[README-dockroot.md](./README-dockroot.md)
+- 可选 Merlin 扩展说明：[../rogsoft-codexproxyd/README.md](../rogsoft-codexproxyd/README.md)

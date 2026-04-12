@@ -17,14 +17,11 @@ If you want to manage the container from the Merlin software center instead of u
 packaging/rogsoft-codexproxyd
 ```
 
-That plugin adds:
+That package is an optional Merlin extension layered on top of this DockRoot packaging. It is not part of the original 方案 2 mainline deliverable, and its control-panel behavior, tests, and acceptance criteria are documented separately in:
 
-- DockRoot and container status display
-- URL and API key display
-- default model / effort / audit log level configuration
-- `accounts.json` / `auth.json` import from the page
-- image pull, start, stop, restart, remove, and key refresh actions
-- runtime log, request audit log, and error log viewing
+```text
+packaging/rogsoft-codexproxyd/README.md
+```
 
 ## Directory layout
 
