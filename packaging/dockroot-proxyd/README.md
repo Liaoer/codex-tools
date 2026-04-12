@@ -39,6 +39,11 @@
 - `alpine` 运行时镜像，便于在容器内排障
 - 启动前强制检查 `/data/accounts.json`
 - 持久化目录固定为 `/data`
+- 镜像内默认启用更保守的路由器保护参数
+  - `CODEX_TOOLS_PROXY_MAX_BODY_MIB=16`
+  - `CODEX_TOOLS_PROXY_MAX_CONCURRENT_REQUESTS=2`
+  - `CODEX_TOOLS_PROXY_LOG_MAX_BYTES=524288`
+  - `CODEX_TOOLS_PROXY_MAX_UPSTREAM_BYTES=8388608`
 - 提供本地 `auth.json -> accounts.json` 转换脚本
 
 ## 可选软件中心控制面板
@@ -101,6 +106,16 @@ docker buildx build \
   --push \
   .
 ```
+
+`<public-image-ref>` 指的是完整镜像引用，也就是“仓库地址:标签”。
+
+例如：
+
+```text
+ghcr.io/liaoer/codex-tools-proxyd:latest
+```
+
+如果你使用 Merlin 面板，这个值也就是页面里“镜像地址”应该填写的内容。
 
 ### 2. 准备账号数据
 

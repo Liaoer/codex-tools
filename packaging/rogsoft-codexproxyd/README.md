@@ -35,6 +35,11 @@
 
 ## 页面说明
 
+- `镜像地址`
+  - 这里填写完整镜像引用，格式是 `仓库地址:标签`
+  - 例如：`ghcr.io/liaoer/codex-tools-proxyd:latest`
+  - 如果你已经把新版本推送到 `latest`，页面里就继续填这个值，不需要改成别的格式
+  - 点“拉取/更新镜像”会执行镜像拉取；点“启动”或“重启”会自动刷新容器挂载配置并重新启动
 - `Default Model`
   - 当前默认值是 `gpt-5.4`
   - 如果客户端请求没有显式传 `model`，服务端会回落到这里配置的默认值
@@ -65,7 +70,7 @@
 1. 在 Merlin 软件中心手动安装 `codexproxyd.tar.gz`
 2. 打开插件页面
 3. 选择 ext4 U 盘或硬盘挂载点
-4. 填写镜像地址
+4. 填写镜像地址，例如 `ghcr.io/liaoer/codex-tools-proxyd:latest`
 5. 按需设置默认 Model、Effort 和日志级别
 6. 点击“保存设置”
 7. 导入 `accounts.json` 或 `auth.json`
@@ -78,6 +83,19 @@
 - `http://127.0.0.1:8787/v1`
 - `http://<router-lan-ip>:8787/v1`
 - 当前 API Key
+
+推荐镜像地址示例：
+
+```text
+ghcr.io/liaoer/codex-tools-proxyd:latest
+```
+
+补充说明：
+
+- `latest` 适合每次重新推送后直接在面板里更新
+- 如果想固定版本，可以改成类似 `ghcr.io/liaoer/codex-tools-proxyd:2026-04-11`
+- “拉取/更新镜像”只负责拉取镜像
+- “启动”或“重启”会自动刷新挂载配置并重新启动容器
 
 ## 构建
 

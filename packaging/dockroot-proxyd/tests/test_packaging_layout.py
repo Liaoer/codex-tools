@@ -18,6 +18,14 @@ class PackagingLayoutTests(unittest.TestCase):
         missing = [str(path) for path in expected_paths if not path.exists()]
         self.assertEqual(missing, [])
 
+    def test_dockerfile_sets_router_safe_resource_limits(self):
+        dockerfile = (PACKAGE_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn("CODEX_TOOLS_PROXY_MAX_BODY_MIB", dockerfile)
+        self.assertIn("CODEX_TOOLS_PROXY_MAX_CONCURRENT_REQUESTS", dockerfile)
+        self.assertIn("CODEX_TOOLS_PROXY_LOG_MAX_BYTES", dockerfile)
+        self.assertIn("CODEX_TOOLS_PROXY_MAX_UPSTREAM_BYTES", dockerfile)
+
 
 if __name__ == "__main__":
     unittest.main()

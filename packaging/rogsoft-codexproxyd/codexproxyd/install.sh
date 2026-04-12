@@ -35,10 +35,11 @@ platform_test() {
 }
 
 install_now() {
-	local plver current_enable current_disk_path current_image_ref current_default_model current_default_effort current_audit_log_level current_last_error current_last_import_at
+	local plver current_enable current_disk_path current_data_dir current_image_ref current_default_model current_default_effort current_audit_log_level current_last_error current_last_import_at
 	plver=$(cat "${DIR}/version")
 	current_enable=$(dbus get ${module}_enable)
 	current_disk_path=$(dbus get ${module}_disk_path_selected)
+	current_data_dir=$(dbus get ${module}_data_dir_value)
 	current_image_ref=$(dbus get ${module}_image_ref)
 	current_default_model=$(dbus get ${module}_default_model)
 	current_default_effort=$(dbus get ${module}_default_effort)
@@ -61,6 +62,7 @@ install_now() {
 	[ -z "${current_audit_log_level}" ] && current_audit_log_level="basic"
 	dbus set ${module}_enable="${current_enable}"
 	dbus set ${module}_disk_path_selected="${current_disk_path}"
+	dbus set ${module}_data_dir_value="${current_data_dir}"
 	dbus set ${module}_image_ref="${current_image_ref}"
 	dbus set ${module}_default_model="${current_default_model}"
 	dbus set ${module}_default_effort="${current_default_effort}"

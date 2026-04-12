@@ -15,6 +15,7 @@ rm -f /koolshare/init.d/S96codexproxyd.sh >/dev/null 2>&1
 
 dbus remove ${module}_enable
 dbus remove ${module}_disk_path_selected
+dbus remove ${module}_data_dir_value
 dbus remove ${module}_image_ref
 dbus remove ${module}_title
 dbus remove ${module}_last_error

@@ -29,7 +29,11 @@ ARG TARGET_TRIPLE
 RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
-ENV CODEX_TOOLS_PROXY_DATA_DIR=/data
+ENV CODEX_TOOLS_PROXY_DATA_DIR=/data \
+    CODEX_TOOLS_PROXY_MAX_BODY_MIB=16 \
+    CODEX_TOOLS_PROXY_MAX_CONCURRENT_REQUESTS=2 \
+    CODEX_TOOLS_PROXY_LOG_MAX_BYTES=524288 \
+    CODEX_TOOLS_PROXY_MAX_UPSTREAM_BYTES=8388608
 
 COPY packaging/dockroot-proxyd/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY --from=builder /build/src-tauri/proxyd/target/${TARGET_TRIPLE}/release/codex-tools-proxyd /usr/local/bin/codex-tools-proxyd
